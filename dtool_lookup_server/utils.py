@@ -5,22 +5,18 @@ import importlib
 import json
 from pkg_resources import iter_entry_points
 
-import yaml
+from flask import current_app
 from sqlalchemy.sql import exists
-
-import pymongo.errors
 
 import dtoolcore.utils
 
 from dtool_lookup_server import (
-    mongo,
     sql_db,
     AuthenticationError,
     AuthorizationError,
     ValidationError,
     UnknownBaseURIError,
-    UnknownURIError,
-    MONGO_COLLECTION,
+    __version__
 )
 from dtool_lookup_server.sql_models import (
     User,
@@ -28,6 +24,13 @@ from dtool_lookup_server.sql_models import (
     Dataset,
 )
 from dtool_lookup_server.config import Config
+
+
+from dtool_lookup_server.date_utils import (
+    extract_created_at_as_datetime,
+    extract_frozen_at_as_datetime,
+)
+
 
 DATASET_INFO_REQUIRED_KEYS = (
     "uuid",
@@ -43,25 +46,25 @@ DATASET_INFO_REQUIRED_KEYS = (
     "tags",
 )
 
-VALID_MONGO_QUERY_KEYS = (
-    "free_text",
-    "creator_usernames",
-    "base_uris",
-    "uuids",
-    "tags",
-)
 
-MONGO_QUERY_LIST_KEYS = (
-    "creator_usernames",
-    "base_uris",
-    "uuids",
-    "tags",
-)
+# These entrypoints might point to plugin modules with
+# config objects to be serialized as part of the global server config:
+DTOOL_LOOKUP_SERVER_PLUGIN_ENTRYPOINTS = ['extension', 'retrieve', 'search']
 
 
 #############################################################################
 # Private helper functions.
 #############################################################################
+
+def _serializable(obj):
+    """Return string representation of object if object itself not json-serializable."""
+    try:
+        json.dumps(obj)
+    except TypeError:
+        return str(obj)
+    else:
+        return obj
+
 
 def _json_serial(obj):
     if isinstance(obj, (datetime, date)):
@@ -77,114 +80,60 @@ def _get_base_uri_obj(base_uri):
     return BaseURI.query.filter_by(base_uri=base_uri).first()
 
 
-def _dict_to_mongo_query(query_dict):
+#############################################################################
+# Public helper functions.
+#############################################################################
 
-    def _sanitise(query_dict):
-        for key in list(query_dict.keys()):
-            if key not in VALID_MONGO_QUERY_KEYS:
-                del query_dict[key]
-        for lk in MONGO_QUERY_LIST_KEYS:
-            if lk in query_dict:
-                if len(query_dict[lk]) == 0:
-                    del query_dict[lk]
+def obj_to_dict(obj, exclusions=[]):
+    """Convert all-upper-case entries in dict-like object to dict and exclude
+       certain keys. """
+    d = dict()
+    for k, v in obj.items():
+        # select only capitalized fields
+        if k.upper() == k and k not in exclusions:
+            d[k] = _serializable(v)
+        elif k.upper() == k and k in exclusions:
+            d[k] = "***" # obfuscate secret
+    return d
 
-    def _deal_with_possible_or_statment(a_list, key):
-        if len(a_list) == 1:
-            return {key: a_list[0]}
-        else:
-            return {"$or": [{key: v} for v in a_list]}
 
-    def _deal_with_possible_and_statement(a_list, key):
-        if len(a_list) == 1:
-            return {key: a_list[0]}
-        else:
-            return {key: {"$all": a_list}}
+def obj_to_lowercase_key_dict(obj, exclusions=[]):
+    """Convert all-upper-case keys in dict-like object to all-lower-case keys
+       dict and exclude certain keys. """
+    d = obj_to_dict(obj, exclusions=exclusions)
+    return {k.lower(): v for k, v in d.items()}
 
-    _sanitise(query_dict)
 
-    sub_queries = []
-    if "free_text" in query_dict:
-        sub_queries.append({"$text": {"$search": query_dict["free_text"]}})
-    if "creator_usernames" in query_dict:
-        sub_queries.append(
-            _deal_with_possible_or_statment(
-                query_dict["creator_usernames"],
-                "creator_username"
-            )
-        )
-    if "base_uris" in query_dict:
-        sub_queries.append(
-            _deal_with_possible_or_statment(
-                query_dict["base_uris"],
-                "base_uri"
-            )
-        )
-    if "uuids" in query_dict:
-        sub_queries.append(
-            _deal_with_possible_or_statment(
-                query_dict["uuids"],
-                "uuid"
-            )
-        )
-    if "tags" in query_dict:
-        sub_queries.append(
-            _deal_with_possible_and_statement(
-                query_dict["tags"],
-                "tags"
-            )
-        )
+def versions_to_dict():
+    """Dumps installed components and their versions to dictionary, i.e.
 
-    if len(sub_queries) == 0:
-        return {}
-    elif len(sub_queries) == 1:
-        return sub_queries[0]
-    else:
-        return {"$and": [q for q in sub_queries]}
+        {
+            'dtool_lookup_server': '0.17.2',
+            'dtool_lookup_server_retrieve_plugin_mongo': '0.1.0',
+            'dtool_lookup_server_search_plugin_mongo': '0.1.0'
+        }
+   """
+
+    versions_dict = {'dtool_lookup_server': __version__}
+    for ep_group in DTOOL_LOOKUP_SERVER_PLUGIN_ENTRYPOINTS:
+        for ep in iter_entry_points("dtool_lookup_server.{}".format(ep_group)):
+            module_name = ep.module_name.split(".")[0]
+
+            # import module
+            try:
+                plugin_module = importlib.import_module(module_name)
+            except ImportError as exc:
+                # plugin import failed, this should not happen
+                continue
+
+            versions_dict[module_name] = getattr(plugin_module, '__version__', None)
+
+    return versions_dict
 
 
 #############################################################################
 # Generally useful dtool helper functions.
 #############################################################################
-
-def config_to_dict(username):
-    # Authenticate the user.
-    get_user_obj(username)
-
-    core_config = Config.to_dict()
-    plugin_config = {}
-
-    # Iterate over all registered blueprints
-    # and get per-plugin configs if implemented.
-    # All plugins are expected to be top-level modules.
-    for ep in iter_entry_points("dtool_lookup_server.blueprints"):
-        module_name = ep.module_name.split(".")[0]
-        if module_name not in plugin_config:
-            try:
-                plugin_module = importlib.import_module(module_name)
-            except ImportError as exc:
-                # plugin import failed, this should not happen
-                plugin_config[module_name] = str(exc)
-                continue
-
-            try:
-                plugin_config[
-                    module_name] = plugin_module.config.Config.to_dict()
-            except AttributeError as exc:
-                # plugin did not implement config.Config.to_dict properly
-                plugin_config[module_name] = str(exc)
-                continue
-
-    # check for overlap between core config keys and plugin names
-    if len(set(core_config.keys()) & set(plugin_config.keys())) > 0:
-        raise ValueError(
-            "Plugin module names and core server config keys must not overlap."
-        )
-
-    all_config = core_config
-    if len(plugin_config) > 0:
-        all_config.update(plugin_config)
-    return all_config
-
 
 def generate_dataset_info(dataset, base_uri):
     """Return dictionary with dataset info."""
@@ -193,11 +142,7 @@ def generate_dataset_info(dataset, base_uri):
     dataset_info["base_uri"] = base_uri
 
     # Add the readme info.
-    readme_info = yaml.load(
-        dataset.get_readme_content(),
-        Loader=yaml.FullLoader
-    )
-    dataset_info["readme"] = readme_info
+    dataset_info["readme"] = dataset.get_readme_content()
 
     # Add the manifest.
     dataset_info["manifest"] = dataset._manifest
@@ -216,12 +161,21 @@ def generate_dataset_info(dataset, base_uri):
     dataset_info_json_str = json.dumps(dataset_info, default=_json_serial)
     dataset_info = json.loads(dataset_info_json_str)
 
+    # Set total number if items
+    dataset_info["number_of_items"] = len(dataset.identifiers)
+
+    # Compute size of dataset
+    dataset_info["size_in_bytes"] = \
+        sum([dataset.item_properties(i)["size_in_bytes"]
+             for i in dataset.identifiers])
+
     return dataset_info
 
 
 #############################################################################
 # User helper functions
 #############################################################################
+
 
 def user_exists(username):
     if _get_user_obj(username) is None:
@@ -232,7 +186,7 @@ def user_exists(username):
 def get_user_obj(username):
     user = _get_user_obj(username)
     if user is None:
-        raise(AuthenticationError())
+        raise (AuthenticationError())
     return user
 
 
@@ -258,9 +212,7 @@ def register_users(users):
         is_admin = user.get("is_admin", False)
 
         # Skip existing users.
-        if sql_db.session.query(
-            exists().where(User.username == username)
-        ).scalar():
+        if sql_db.session.query(exists().where(User.username == username)).scalar():  # NOQA
             continue
 
         user = User(username=username, is_admin=is_admin)
@@ -297,7 +249,9 @@ def delete_users(users):
     for user in users:
         username = user["username"]
 
-        for sqlalch_user_obj in sql_db.session.query(User).filter_by(username=username).all():  # NOQA
+        for sqlalch_user_obj in (
+            sql_db.session.query(User).filter_by(username=username).all()
+        ):  # NOQA
             sql_db.session.delete(sqlalch_user_obj)
 
     sql_db.session.commit()
@@ -322,7 +276,9 @@ def update_users(users):
         username = user["username"]
         is_admin = user.get("is_admin", False)
 
-        for sqlalch_user_obj in sql_db.session.query(User).filter_by(username=username).all():  # NOQA
+        for sqlalch_user_obj in (
+            sql_db.session.query(User).filter_by(username=username).all()
+        ):  # NOQA
             sqlalch_user_obj.is_admin = is_admin
 
     sql_db.session.commit()
@@ -344,6 +300,7 @@ def get_user_info(username):
 #############################################################################
 # Dataset list/search/lookup helper functions.
 #############################################################################
+
 
 def list_datasets_by_user(username):
     """List the datasets the user has access to.
@@ -372,10 +329,7 @@ def _preprocess_privileges(username, query):
     if "base_uris" not in query:
         query["base_uris"] = allowed_uris
     else:
-        selected_uris = [
-            str(bu) for bu in query["base_uris"]
-            if bu in allowed_uris
-        ]
+        selected_uris = [str(bu) for bu in query["base_uris"] if bu in allowed_uris]  # NOQA
         query["base_uris"] = selected_uris
 
     return query
@@ -411,26 +365,7 @@ def search_datasets_by_user(username, query):
     if len(query["base_uris"]) == 0:
         return []
 
-    datasets = []
-    mongo_query = _dict_to_mongo_query(query)
-    cx = mongo.db[MONGO_COLLECTION].find(
-        mongo_query,
-        {
-            "_id": False,
-            "readme": False,
-            "manifest": False,
-            "annotations": False,
-        }
-    )
-    for ds in cx:
-
-        # Convert datetime object to float timestamp.
-        for key in ("created_at", "frozen_at"):
-            datetime_obj = ds[key]
-            ds[key] = dtoolcore.utils.timestamp(datetime_obj)
-
-        datasets.append(ds)
-    return datasets
+    return current_app.search.search(query)
 
 
 def summary_of_datasets_by_user(username):
@@ -485,12 +420,14 @@ def lookup_datasets_by_user_and_uuid(username, uuid):
     user = get_user_obj(username)
 
     datasets = []
-    query = sql_db.session.query(Dataset, User)  \
-        .join(User.search_base_uris)  \
-        .filter(Dataset.uuid == uuid)  \
-        .filter(User.username == username)  \
-        .filter(BaseURI.id == Dataset.base_uri_id)  \
+    query = (
+        sql_db.session.query(Dataset, User)
+        .join(User.search_base_uris)
+        .filter(Dataset.uuid == uuid)
+        .filter(User.username == username)
+        .filter(BaseURI.id == Dataset.base_uri_id)
         .all()
+    )
 
     for ds, user in query:
         datasets.append(ds.as_dict())
@@ -501,6 +438,7 @@ def lookup_datasets_by_user_and_uuid(username, uuid):
 #############################################################################
 # Base URI helper functions
 #############################################################################
+
 
 def base_uri_exists(base_uri):
     """Return True if the base URI has been registered."""
@@ -513,9 +451,7 @@ def get_base_uri_obj(base_uri):
     """Return SQLAlchemy BaseURI object."""
     base_uri_obj = _get_base_uri_obj(base_uri)
     if base_uri_obj is None:
-        raise(ValidationError(
-            "Base URI {} not registered".format(base_uri)
-        ))
+        raise (ValidationError("Base URI {} not registered".format(base_uri)))
     return base_uri_obj
 
 
@@ -538,6 +474,7 @@ def list_base_uris():
 #############################################################################
 # Permission helper functions
 #############################################################################
+
 
 def get_permission_info(base_uri_str):
     """Return the permissions of on a base URI as a dictionary."""
@@ -570,6 +507,7 @@ def update_permissions(permissions):
 # Register dataset helper functions
 #############################################################################
 
+
 def dataset_info_is_valid(dataset_info):
     """Return True if the dataset info is valid."""
 
@@ -583,7 +521,7 @@ def dataset_info_is_valid(dataset_info):
         return False
 
     # Ensure that the UUID has the correct number of characters.
-    if len(dataset_info["uuid"]) != 36:
+    if len(str(dataset_info["uuid"])) != 36:
         return False
 
     # Ensure that the base URI has had any trailing slash removed.
@@ -593,117 +531,54 @@ def dataset_info_is_valid(dataset_info):
     return True
 
 
-def _extract_created_at_as_datetime(admin_metadata):
-    """Return created_at as datetime
-    Use frozen_at if created_at is missing.
-    Deal with some created_at values being strings.
-    """
-    try:
-        created_at = admin_metadata["created_at"]
-    except KeyError:
-        created_at = admin_metadata["frozen_at"]
-    created_at = float(created_at)
-    return datetime.utcfromtimestamp(created_at)
-
-
-def _extract_frozen_at_as_datatime(admin_metadata):
-    frozen_at = admin_metadata["frozen_at"]
-    frozen_at = float(frozen_at)
-    return datetime.utcfromtimestamp(frozen_at)
-
-
 def register_dataset_admin_metadata(admin_metadata):
     """Register the admin metadata in the dataset SQL table."""
     base_uri = get_base_uri_obj(admin_metadata["base_uri"])
 
-    frozen_at = _extract_frozen_at_as_datatime(admin_metadata)
-    created_at = _extract_created_at_as_datetime(admin_metadata)
+    frozen_at = extract_frozen_at_as_datetime(admin_metadata)
+    created_at = extract_created_at_as_datetime(admin_metadata)
+
+    try:
+        number_of_items = admin_metadata["number_of_items"]
+    except KeyError:
+        number_of_items = None
+
+    try:
+        size_in_bytes = admin_metadata["size_in_bytes"]
+    except KeyError:
+        size_in_bytes = None
 
     dataset = Dataset(
         uri=admin_metadata["uri"],
         base_uri_id=base_uri.id,
-        uuid=admin_metadata["uuid"],
+        uuid=str(admin_metadata["uuid"]),
         name=admin_metadata["name"],
         creator_username=admin_metadata["creator_username"],
         frozen_at=frozen_at,
-        created_at=created_at
+        created_at=created_at,
+        number_of_items=number_of_items,
+        size_in_bytes=size_in_bytes,
     )
     sql_db.session.add(dataset)
     sql_db.session.commit()
 
 
-def register_dataset_descriptive_metadata(dataset_info):
-
-    # Validate that the base URI exists.
-    get_base_uri_obj(dataset_info["base_uri"])
-
-    collection = mongo.db[MONGO_COLLECTION]
-    _register_dataset_descriptive_metadata(collection, dataset_info)
-
-
-def _register_dataset_descriptive_metadata(collection, dataset_info):
-    """Register dataset info in the collection.
-
-    If the "uuid" and "uri" are the same as another record in
-    the mongodb collection a new record is not created, and
-    the UUID is returned.
-
-    Returns None if dataset_info is invalid.
-    Returns UUID of dataset otherwise.
-    """
-    if not dataset_info_is_valid(dataset_info):
-        return None
-
-    frozen_at = _extract_frozen_at_as_datatime(dataset_info)
-    created_at = _extract_created_at_as_datetime(dataset_info)
-
-    dataset_info["frozen_at"] = frozen_at
-    dataset_info["created_at"] = created_at
-
-    query = {
-        "uuid": dataset_info["uuid"],
-        "uri": dataset_info["uri"]
-    }
-
-    # If a record with the same UUID and URI exists return the uuid
-    # without adding a duplicate record.
-    exists = collection.find_one(query)
-
-    if exists is None:
-        collection.insert_one(dataset_info)
-    else:
-        collection.find_one_and_replace(query, dataset_info)
-
-    # The MongoDB client dynamically updates the dataset_info dict
-    # with and '_id' key. Remove it.
-    if "_id" in dataset_info:
-        del dataset_info["_id"]
-
-    return dataset_info["uuid"]
-
-
 def register_dataset(dataset_info):
     """Register a dataset in the lookup server."""
     if not dataset_info_is_valid(dataset_info):
-        raise(ValidationError(
-            "Dataset info not valid: {}".format(dataset_info)
-        ))
+        raise (ValidationError("Dataset info not valid: {}".format(dataset_info)))  # NOQA
 
     base_uri = dataset_info["base_uri"]
     if not base_uri_exists(base_uri):
-        raise(ValidationError(
-            "Base URI is not registered: {}".format(base_uri)
-        ))
+        raise (ValidationError("Base URI is not registered: {}".format(base_uri)))  # NOQA
 
-    try:
-        # Take a copy as register_dataset_descriptive_metadata makes
-        # changes to the dictionary, in particular it changes the
-        # types of the dates to datetime objects.
-        register_dataset_descriptive_metadata(dataset_info.copy())
-    except pymongo.errors.DocumentTooLarge as e:
-        raise(ValidationError(
-            "Dataset has too much metadata: {}".format(e)
-        ))
+    # Take a copy as register_dataset_descriptive_metadata makes
+    # changes to the dictionary, in particular it changes the
+    # types of the dates to datetime objects.
+    current_app.search.register_dataset(dataset_info.copy())
+    current_app.retrieve.register_dataset(dataset_info.copy())
+    for ex in current_app.custom_extensions:
+        ex.register_dataset(dataset_info.copy())
 
     if get_admin_metadata_from_uri(dataset_info["uri"]) is None:
         register_dataset_admin_metadata(dataset_info)
@@ -715,6 +590,7 @@ def register_dataset(dataset_info):
 # Dataset information retrieval helper functions.
 #############################################################################
 
+
 def get_admin_metadata_from_uri(uri):
     """Return the dataset SQL table row as dictionary."""
     dataset = Dataset.query.filter_by(uri=uri).first()
@@ -723,6 +599,16 @@ def get_admin_metadata_from_uri(uri):
         return None
 
     return dataset.as_dict()
+
+
+def list_admin_metadata_in_base_uri(base_uri_str):
+    """Return list of dictionaries with admin metadata from dataset SQL table."""  # NOQA
+    base_uri = get_base_uri_obj(base_uri_str)
+
+    if base_uri is None:
+        return None
+
+    return [ds.as_dict() for ds in base_uri.datasets]
 
 
 def get_readme_from_uri_by_user(username, uri):
@@ -742,45 +628,12 @@ def get_readme_from_uri_by_user(username, uri):
     base_uri_str = uri.rsplit("/", 1)[0]
     base_uri = _get_base_uri_obj(base_uri_str)
     if base_uri is None:
-        raise(UnknownBaseURIError())
+        raise (UnknownBaseURIError())
 
     if base_uri not in user.search_base_uris:
-        raise(AuthorizationError())
+        raise (AuthorizationError())
 
-    collection = mongo.db[MONGO_COLLECTION]
-    item = collection.find_one({"uri": uri})
-    if item is None:
-        raise(UnknownURIError())
-    return item["readme"]
-
-
-def get_annotations_from_uri_by_user(username, uri):
-    """Return the annotations.
-
-    :param username: username
-    :param uri: dataset URI
-    :returns: dataset annotations
-    :raises: AuthenticationError if user is invalid.
-             AuthorizationError if the user has not got permissions to read
-             content in the base URI
-             UnknownBaseURIError if the base URI has not been registered.
-             UnknownURIError if the URI is not available to the user.
-    """
-    user = get_user_obj(username)
-
-    base_uri_str = uri.rsplit("/", 1)[0]
-    base_uri = _get_base_uri_obj(base_uri_str)
-    if base_uri is None:
-        raise(UnknownBaseURIError())
-
-    if base_uri not in user.search_base_uris:
-        raise(AuthorizationError())
-
-    collection = mongo.db[MONGO_COLLECTION]
-    item = collection.find_one({"uri": uri})
-    if item is None:
-        raise(UnknownURIError())
-    return item["annotations"]
+    return current_app.retrieve.get_readme(uri)
 
 
 def get_manifest_from_uri_by_user(username, uri):
@@ -800,24 +653,34 @@ def get_manifest_from_uri_by_user(username, uri):
     base_uri_str = uri.rsplit("/", 1)[0]
     base_uri = _get_base_uri_obj(base_uri_str)
     if base_uri is None:
-        raise(UnknownBaseURIError())
+        raise (UnknownBaseURIError())
 
     if base_uri not in user.search_base_uris:
-        raise(AuthorizationError())
+        raise (AuthorizationError())
 
-    collection = mongo.db[MONGO_COLLECTION]
-    item = collection.find_one({"uri": uri})
-    if item is None:
-        raise(UnknownURIError())
-    return item["manifest"]
+    return current_app.retrieve.get_manifest(uri)
 
 
-def list_admin_metadata_in_base_uri(base_uri_str):
-    """Return list of dictionaries with admin metadata from dataset SQL table.
+def get_annotations_from_uri_by_user(username, uri):
+    """Return the annotations.
+
+    :param username: username
+    :param uri: dataset URI
+    :returns: dataset annotations
+    :raises: AuthenticationError if user is invalid.
+             AuthorizationError if the user has not got permissions to read
+             content in the base URI
+             UnknownBaseURIError if the base URI has not been registered.
+             UnknownURIError if the URI is not available to the user.
     """
-    base_uri = get_base_uri_obj(base_uri_str)
+    user = get_user_obj(username)
 
+    base_uri_str = uri.rsplit("/", 1)[0]
+    base_uri = _get_base_uri_obj(base_uri_str)
     if base_uri is None:
-        return None
+        raise (UnknownBaseURIError())
 
-    return [ds.as_dict() for ds in base_uri.datasets]
+    if base_uri not in user.search_base_uris:
+        raise (AuthorizationError())
+
+    return current_app.retrieve.get_annotations(uri)

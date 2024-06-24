@@ -2,6 +2,10 @@ import random
 import string
 import os
 import sys
+import tempfile
+import shutil
+
+from contextlib import contextmanager
 
 import pytest
 
@@ -27,18 +31,55 @@ def random_string(
     return prefix + ''.join(random.choice(chars) for _ in range(size))
 
 
+@contextmanager
+def tmp_env_var(key, value):
+    os.environ[key] = value
+    yield
+    del os.environ[key]
+
+
+@contextmanager
+def tmp_dir():
+    d = tempfile.mkdtemp()
+    yield d
+    shutil.rmtree(d)
+
+
 @pytest.fixture
 def tmp_app(request):
 
-    from dtool_lookup_server import create_app, mongo, sql_db
+    from flask import current_app
+    from dtool_lookup_server import create_app, sql_db
 
     tmp_mongo_db_name = random_string()
 
     config = {
+        "CONFIG_SECRETS_TO_OBFUSCATE": [],
+        "API_TITLE": 'dtool-lookup-server API',
+        "API_VERSION": 'v1',
+        "OPENAPI_VERSION": '3.0.2',
+        "API_SPEC_OPTIONS": {
+            'x-internal-id': '2',
+            'security': [{"bearerAuth": []}],
+            'components': {
+                "securitySchemes": {
+                    "bearerAuth": {
+                        "type": "http",
+                        "scheme": "bearer",
+                        "bearerFormat": "JWT"
+                    }
+                }
+            }
+        },
         "SECRET_KEY": "secret",
         "FLASK_ENV": "development",
         "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
-        "MONGO_URI": "mongodb://localhost:27017/{}".format(tmp_mongo_db_name),
+        "RETRIEVE_MONGO_URI": "mongodb://localhost:27017/",
+        "RETRIEVE_MONGO_DB": tmp_mongo_db_name,
+        "RETRIEVE_MONGO_COLLECTION": "datasets",
+        "SEARCH_MONGO_URI": "mongodb://localhost:27017/",
+        "SEARCH_MONGO_DB": tmp_mongo_db_name,
+        "SEARCH_MONGO_COLLECTION": "datasets",
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
         "JWT_ALGORITHM": "RS256",
         "JWT_PUBLIC_KEY": JWT_PUBLIC_KEY,
@@ -57,7 +98,8 @@ def tmp_app(request):
 
     @request.addfinalizer
     def teardown():
-        mongo.cx.drop_database(tmp_mongo_db_name)
+        current_app.retrieve.client.drop_database(tmp_mongo_db_name)
+        current_app.search.client.drop_database(tmp_mongo_db_name)
         sql_db.session.remove()
 
     return app.test_client()
@@ -66,7 +108,9 @@ def tmp_app(request):
 @pytest.fixture
 def tmp_app_with_users(request):
 
-    from dtool_lookup_server import create_app, mongo, sql_db
+    from flask import current_app
+
+    from dtool_lookup_server import create_app, sql_db
     from dtool_lookup_server.utils import (
         register_users,
         register_base_uri,
@@ -76,10 +120,19 @@ def tmp_app_with_users(request):
     tmp_mongo_db_name = random_string()
 
     config = {
+        "CONFIG_SECRETS_TO_OBFUSCATE": [],
+        "API_TITLE": 'dtool-lookup-server API',
+        "API_VERSION": 'v1',
+        "OPENAPI_VERSION": '3.0.2',
         "SECRET_KEY": "secret",
         "FLASK_ENV": "development",
         "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
-        "MONGO_URI": "mongodb://localhost:27017/{}".format(tmp_mongo_db_name),
+        "RETRIEVE_MONGO_URI": "mongodb://localhost:27017/",
+        "RETRIEVE_MONGO_DB": tmp_mongo_db_name,
+        "RETRIEVE_MONGO_COLLECTION": "datasets",
+        "SEARCH_MONGO_URI": "mongodb://localhost:27017/",
+        "SEARCH_MONGO_DB": tmp_mongo_db_name,
+        "SEARCH_MONGO_COLLECTION": "datasets",
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
         "JWT_ALGORITHM": "RS256",
         "JWT_PUBLIC_KEY": JWT_PUBLIC_KEY,
@@ -115,7 +168,8 @@ def tmp_app_with_users(request):
 
     @request.addfinalizer
     def teardown():
-        mongo.cx.drop_database(tmp_mongo_db_name)
+        current_app.retrieve.client.drop_database(tmp_mongo_db_name)
+        current_app.search.client.drop_database(tmp_mongo_db_name)
         sql_db.session.remove()
 
     return app.test_client()
@@ -124,7 +178,9 @@ def tmp_app_with_users(request):
 @pytest.fixture
 def tmp_app_with_data(request):
 
-    from dtool_lookup_server import create_app, mongo, sql_db
+    from flask import current_app
+
+    from dtool_lookup_server import create_app, sql_db
     from dtool_lookup_server.utils import (
         register_users,
         register_base_uri,
@@ -135,9 +191,17 @@ def tmp_app_with_data(request):
     tmp_mongo_db_name = random_string()
 
     config = {
+        "API_TITLE": 'dtool-lookup-server API',
+        "API_VERSION": 'v1',
+        "OPENAPI_VERSION": '3.0.2',
         "FLASK_ENV": "development",
         "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
-        "MONGO_URI": "mongodb://localhost:27017/{}".format(tmp_mongo_db_name),
+        "RETRIEVE_MONGO_URI": "mongodb://localhost:27017/",
+        "RETRIEVE_MONGO_DB": tmp_mongo_db_name,
+        "RETRIEVE_MONGO_COLLECTION": "datasets",
+        "SEARCH_MONGO_URI": "mongodb://localhost:27017/",
+        "SEARCH_MONGO_DB": tmp_mongo_db_name,
+        "SEARCH_MONGO_COLLECTION": "datasets",
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
         "JWT_ALGORITHM": "RS256",
         "JWT_PUBLIC_KEY": JWT_PUBLIC_KEY,
@@ -182,7 +246,7 @@ def tmp_app_with_data(request):
             "uuid": uuid,
             "uri": uri,
             "name": "bad-apples",
-            "readme": {"descripton": "apples from queen"},
+            "readme": "---\ndescripton: apples from queen",
             "manifest": {
                 "dtoolcore_version": "3.7.0",
                 "hash_function": "md5sum_hexdigest",
@@ -199,6 +263,8 @@ def tmp_app_with_data(request):
             "frozen_at": 1536238185.881941,
             "annotations": {"type": "fruit"},
             "tags": ["evil", "fruit"],
+            "size_in_bytes": 5741810,
+            "number_of_items": 1,
         }
         register_dataset(dataset_info)
 
@@ -211,7 +277,7 @@ def tmp_app_with_data(request):
         "uuid": uuid,
         "uri": uri,
         "name": "oranges",
-        "readme": {"descripton": "oranges from queen"},
+        "readme": "---\ndescripton: oranges from queen",
         "manifest": {
             "dtoolcore_version": "3.7.0",
             "hash_function": "md5sum_hexdigest",
@@ -221,12 +287,15 @@ def tmp_app_with_data(request):
         "frozen_at": 1536238185.881941,
         "annotations": {"type": "fruit", "only_here": "crazystuff"},
         "tags": ["good", "fruit"],
+        "size_in_bytes": 0,
+        "number_of_items": 0,
     }
     register_dataset(dataset_info)
 
     @request.addfinalizer
     def teardown():
-        mongo.cx.drop_database(tmp_mongo_db_name)
+        current_app.retrieve.client.drop_database(tmp_mongo_db_name)
+        current_app.search.client.drop_database(tmp_mongo_db_name)
         sql_db.session.remove()
 
     return app.test_client()
@@ -235,14 +304,24 @@ def tmp_app_with_data(request):
 @pytest.fixture
 def tmp_cli_runner(request):
 
-    from dtool_lookup_server import create_app, mongo, sql_db
+    from flask import current_app
+
+    from dtool_lookup_server import create_app, sql_db
 
     tmp_mongo_db_name = random_string()
 
     config = {
+        "API_TITLE": 'dtool-lookup-server API',
+        "API_VERSION": 'v1',
+        "OPENAPI_VERSION": '3.0.2',
         "FLASK_ENV": "development",
         "SQLALCHEMY_DATABASE_URI": "sqlite:///:memory:",
-        "MONGO_URI": "mongodb://localhost:27017/{}".format(tmp_mongo_db_name),
+        "RETRIEVE_MONGO_URI": "mongodb://localhost:27017/",
+        "RETRIEVE_MONGO_DB": tmp_mongo_db_name,
+        "RETRIEVE_MONGO_COLLECTION": "datasets",
+        "SEARCH_MONGO_URI": "mongodb://localhost:27017/",
+        "SEARCH_MONGO_DB": tmp_mongo_db_name,
+        "SEARCH_MONGO_COLLECTION": "datasets",
         "SQLALCHEMY_TRACK_MODIFICATIONS": False,
         "SECRET_KEY": "dev"
     }
@@ -257,7 +336,8 @@ def tmp_cli_runner(request):
 
     @request.addfinalizer
     def teardown():
-        mongo.cx.drop_database(tmp_mongo_db_name)
+        current_app.retrieve.client.drop_database(tmp_mongo_db_name)
+        current_app.search.client.drop_database(tmp_mongo_db_name)
         sql_db.session.remove()
 
     return app.test_cli_runner()

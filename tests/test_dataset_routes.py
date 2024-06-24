@@ -253,7 +253,7 @@ def test_dataset_register_route(tmp_app_with_users):  # NOQA
         "uri": uri,
         "name": "my-dataset",
         "type": "dataset",
-        "readme": {"description": "test dataset"},
+        "readme": "---\ndescription: test dataset",
         "manifest": {
             "dtoolcore_version": "3.7.0",
             "hash_function": "md5sum_hexdigest",
@@ -267,9 +267,11 @@ def test_dataset_register_route(tmp_app_with_users):  # NOQA
             }
         },
         "creator_username": "olssont",
-        "frozen_at": 1536238185.881941,
+        "frozen_at": "1536238185.881941",
         "annotations": {"software": "bowtie2"},
         "tags": ["rnaseq"],
+        "number_of_items": 1,
+        "size_in_bytes": 5741810,
     }
 
     for token in [dopey_token, sleepy_token]:
@@ -301,6 +303,8 @@ def test_dataset_register_route(tmp_app_with_users):  # NOQA
         "creator_username": "olssont",
         "frozen_at": 1536238185.881941,
         "created_at": 1536238185.881941,
+        "number_of_items": 1,
+        "size_in_bytes": 5741810,
     }
     assert get_admin_metadata_from_uri(uri) == expected_content
 
@@ -313,7 +317,7 @@ def test_dataset_register_route(tmp_app_with_users):  # NOQA
         "uri": uri,
         "name": "my-dataset",
         "type": "dataset",
-        "readme": {"description": "new metadata"},
+        "readme": "---\ndescription: new metadata",
         "manifest": {
             "dtoolcore_version": "3.7.0",
             "hash_function": "md5sum_hexdigest",
@@ -327,9 +331,11 @@ def test_dataset_register_route(tmp_app_with_users):  # NOQA
             }
         },
         "creator_username": "olssont",
-        "frozen_at": 1536238185.881941,
+        "frozen_at": "1536238185.881941",
         "annotations": {"software": "bowtie2"},
         "tags": ["rnaseq"],
+        "number_of_items": 1,
+        "size_in_bytes": 1536238185.881941,
     }
     r = tmp_app_with_users.post(
         "/dataset/register",
@@ -365,9 +371,9 @@ def test_dataset_register_route(tmp_app_with_users):  # NOQA
         "uri": uri,
         "name": "my-dataset",
         "type": "dataset",
-        "readme": {"description": "new metadata"},
+        "readme": "---\ndescription: new metadata",
         "creator_username": "olssont",
-        "frozen_at": 1536238185.881941,
+        "frozen_at": "1536238185.881941",
     }
     r = tmp_app_with_users.post(
         "/dataset/register",
@@ -394,7 +400,7 @@ def test_dataset_register_route_when_created_at_is_string(tmp_app_with_users):  
         "uri": uri,
         "name": "my-dataset",
         "type": "dataset",
-        "readme": {"description": "test dataset"},
+        "readme": "---\ndescription: test dataset",
         "manifest": {
             "dtoolcore_version": "3.7.0",
             "hash_function": "md5sum_hexdigest",
@@ -408,8 +414,10 @@ def test_dataset_register_route_when_created_at_is_string(tmp_app_with_users):  
             }
         },
         "creator_username": "olssont",
-        "frozen_at": 1536238185.881941,
+        "frozen_at": "1536238185.881941",
         "created_at": "1536238185.881941",
+        "number_of_items": 1,
+        "size_in_bytes": 5741810,
         "annotations": {"software": "bowtie2"},
         "tags": ["rnaseq"],
     }
@@ -431,6 +439,8 @@ def test_dataset_register_route_when_created_at_is_string(tmp_app_with_users):  
         "creator_username": "olssont",
         "frozen_at": 1536238185.881941,
         "created_at": 1536238185.881941,
+        "number_of_items": 1,
+        "size_in_bytes": 5741810,
     }
     assert get_admin_metadata_from_uri(uri) == expected_content
 
@@ -493,7 +503,7 @@ def test_dataset_manifest_route(tmp_app_with_data):  # NOQA
 
     # Not authenticated, but in system.
     r = tmp_app_with_data.post(
-        "/dataset/search",
+        "/dataset/manifest",
         headers=dict(Authorization="Bearer " + dopey_token),
         data=json.dumps(query),
         content_type="application/json"
@@ -502,7 +512,7 @@ def test_dataset_manifest_route(tmp_app_with_data):  # NOQA
 
     # Not authenticated, not in system.
     r = tmp_app_with_data.post(
-        "/dataset/search",
+        "/dataset/manifest",
         headers=dict(Authorization="Bearer " + noone_token),
         data=json.dumps(query),
         content_type="application/json"
@@ -546,7 +556,7 @@ def test_dataset_manifest_route(tmp_app_with_data):  # NOQA
         data=json.dumps(query),
         content_type="application/json"
     )
-    assert r.status_code == 400
+    assert r.status_code == 422
 
 
 def test_dataset_readme_route(tmp_app_with_data):  # NOQA
@@ -561,7 +571,7 @@ def test_dataset_readme_route(tmp_app_with_data):  # NOQA
     )
     assert r.status_code == 200
 
-    expected_readme = {"descripton": "apples from queen"}
+    expected_readme = "---\ndescripton: apples from queen"
     actual_readme = json.loads(r.data.decode("utf-8"))
 
     assert expected_readme == actual_readme
